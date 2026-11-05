@@ -83,8 +83,10 @@ class FakeRegistry:
             self.blobs[_digest(archive)] = blob_override if blob_override is not None else archive
             manifest = json.dumps({
                 "mediaType": "application/vnd.oci.image.manifest.v1+json",
-                "layers": [{"mediaType": "application/zip", "digest": _digest(archive), "size": len(archive),
-                            "annotations": {"org.opencontainers.image.title": "kubelogin.zip"}}],
+                "layers": [{"mediaType": "application/vnd.oci.image.layer.v1.tar", "digest": _digest(archive),
+                            "size": len(archive),
+                            "annotations": {"org.opencontainers.image.title":
+                                            "kubelogin-{}-{}.zip".format(os_name, arch)}}],
             }).encode()
             self.manifests[_digest(manifest)] = manifest
             entries.append({"digest": _digest(manifest), "platform": {"os": os_name, "architecture": arch}})
@@ -196,10 +198,20 @@ class TestKubeloginOci(unittest.TestCase):
             client.download_blob(layer, os.path.join(self.temp_dir, "kubelogin.zip"))
 
     def test_unexpected_layer_format(self):
-        with self.assertRaises(ClientRequestError):
-            get_archive_layer({"layers": [{"mediaType": "application/octet-stream"}]})
-        with self.assertRaises(ClientRequestError):
-            get_archive_layer({"layers": []})
+        zip_layer = {"mediaType": "application/vnd.oci.image.layer.v1.tar",
+                     "annotations": {"org.opencontainers.image.title": "kubelogin-linux-amd64.zip"}}
+        self.assertIs(get_archive_layer({"layers": [zip_layer]}), zip_layer)
+        cases = [
+            [],
+            [zip_layer, zip_layer],
+            [{"mediaType": "application/vnd.oci.image.layer.v1.tar",
+              "annotations": {"org.opencontainers.image.title": "kubelogin"}}],
+            [{"mediaType": "application/vnd.oci.image.layer.v1.tar"}],
+        ]
+        for layers in cases:
+            with self.subTest(layers=layers):
+                with self.assertRaises(ClientRequestError):
+                    get_archive_layer({"layers": layers})
 
     def test_extract_single_file_rejects_unexpected_content(self):
         archive = os.path.join(self.temp_dir, "a.zip")

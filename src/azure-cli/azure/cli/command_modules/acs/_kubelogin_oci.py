@@ -23,7 +23,6 @@ logger = get_logger(__name__)
 MEDIA_TYPE_OCI_INDEX = "application/vnd.oci.image.index.v1+json"
 MEDIA_TYPE_OCI_MANIFEST = "application/vnd.oci.image.manifest.v1+json"
 MEDIA_TYPE_DOCKER_LIST = "application/vnd.docker.distribution.manifest.list.v2+json"
-MEDIA_TYPE_ZIP_LAYER = "application/zip"
 ANNOTATION_TITLE = "org.opencontainers.image.title"
 
 _RETRY_STATUS_CODES = (429, 500, 502, 503, 504)
@@ -62,12 +61,15 @@ def select_platform(index, os_name, architecture):
 
 
 def get_archive_layer(manifest):
-    """Return the descriptor of the single zip layer of a client binary manifest."""
+    """Return the descriptor of the single zip layer of a client binary manifest.
+
+    The layer is identified by its title (the release asset name, `*.zip`); media types are the
+    oras defaults and are not part of the contract."""
     layers = manifest.get("layers") or []
-    if len(layers) != 1 or layers[0].get("mediaType") != MEDIA_TYPE_ZIP_LAYER:
+    titles = [(layer.get("annotations") or {}).get(ANNOTATION_TITLE, "") for layer in layers]
+    if len(layers) != 1 or not titles[0].lower().endswith(".zip"):
         raise ClientRequestError(
-            "Unexpected artifact format: expected one '{}' layer, got {}.".format(
-                MEDIA_TYPE_ZIP_LAYER, [layer.get("mediaType") for layer in layers]))
+            "Unexpected artifact format: expected one '*.zip' layer, got {}.".format(titles))
     return layers[0]
 
 

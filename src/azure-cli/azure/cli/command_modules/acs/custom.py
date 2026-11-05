@@ -3131,10 +3131,12 @@ def k8s_install_kubelogin(cmd, client_version='latest', install_location=None, s
 
     cloud_name = cmd.cli_ctx.cloud.name
 
+    if not source_url and cloud_name.lower() == 'azurechinacloud':
+        _k8s_install_kubelogin_from_registry(client_version, install_location, arch)
+        return
+
     if not source_url:
         source_url = 'https://github.com/Azure/kubelogin/releases/download'
-        if cloud_name.lower() == 'azurechinacloud':
-            source_url = 'https://mirror.azure.cn/kubernetes/kubelogin'
 
     if client_version == 'latest':
         client_version = _get_latest_kubelogin_version(cloud_name, gh_token=gh_token)
@@ -3181,6 +3183,47 @@ def k8s_install_kubelogin(cmd, client_version='latest', install_location=None, s
         shutil.move(download_path, install_location)
     os.chmod(install_location, os.stat(install_location).st_mode |
              stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+    if system == 'Windows':
+        handle_windows_post_install(install_dir, cli)
+    else:
+        logger.warning('Please ensure that %s is in your search PATH, so the `%s` command can be found.',
+                       install_dir, cli)
+
+
+_KUBELOGIN_REGISTRY = 'mcr.azure.cn'
+_KUBELOGIN_REPOSITORY = 'aks/packages/kubernetes/kubelogin'
+
+
+def _k8s_install_kubelogin_from_registry(client_version, install_location, arch=None):
+    from azure.cli.command_modules.acs._kubelogin_oci import install_binary_from_registry
+
+    system = platform.system()
+    if system == 'Windows':
+        os_name, binary_name, arch = 'windows', 'kubelogin.exe', 'amd64'
+    elif system in ('Linux', 'Darwin'):
+        os_name, binary_name = system.lower(), 'kubelogin'
+        if arch is None:
+            arch = get_arch_for_cli_binary()
+    else:
+        raise UnknownError("Unsupported system '{}'.".format(system))
+
+    validate_install_location(install_location, binary_name)
+    install_dir, cli = os.path.dirname(install_location), os.path.basename(install_location)
+    if not os.path.exists(install_dir):
+        os.makedirs(install_dir)
+
+    version = client_version if client_version == 'latest' else 'v{}'.format(client_version.lstrip('vV'))
+    archive_member = 'bin/{}_{}/{}'.format(os_name, arch, binary_name)
+    try:
+        install_binary_from_registry(_KUBELOGIN_REGISTRY, _KUBELOGIN_REPOSITORY, version, os_name, arch,
+                                     archive_member, install_location)
+    except ClientRequestError as ex:
+        raise ClientRequestError(
+            'Failed to install kubelogin from {}/{}: {}'.format(_KUBELOGIN_REGISTRY, _KUBELOGIN_REPOSITORY, ex),
+            recommendation='Please retry later, or use --kubelogin-base-src-url to download kubelogin '
+                           'from another source.') from ex
+    os.chmod(install_location, os.stat(install_location).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
     if system == 'Windows':
         handle_windows_post_install(install_dir, cli)

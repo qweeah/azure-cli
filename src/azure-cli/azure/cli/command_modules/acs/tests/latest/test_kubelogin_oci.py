@@ -4,18 +4,21 @@
 # --------------------------------------------------------------------------------------------
 
 import hashlib
+import io
 import json
 import os
 import shutil
 import tempfile
 import unittest
+import zipfile
 from unittest import mock
 
 import requests
 from azure.cli.command_modules.acs._kubelogin_oci import (
     MEDIA_TYPE_OCI_INDEX,
     OciRegistryClient,
-    get_binary_layer,
+    extract_single_file,
+    get_archive_layer,
     install_binary_from_registry,
     latest_stable_tag,
     parse_bearer_challenge,
@@ -31,6 +34,18 @@ PLATFORMS = [("linux", "amd64"), ("linux", "arm64"), ("darwin", "amd64"), ("darw
 
 def _digest(data):
     return "sha256:" + hashlib.sha256(data).hexdigest()
+
+
+def _member(os_name, arch):
+    return "bin/{}_{}/{}".format(os_name, arch, "kubelogin.exe" if os_name == "windows" else "kubelogin")
+
+
+def _zip(files):
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        for name, content in files.items():
+            archive.writestr(name, content)
+    return buffer.getvalue()
 
 
 class FakeResponse:
@@ -57,19 +72,19 @@ class FakeResponse:
 
 
 class FakeRegistry:
-    """In-memory registry serving one version with one binary per platform; requires a bearer token."""
+    """In-memory registry serving one release zip per platform; requires a bearer token."""
 
     def __init__(self, tags=("v0.2.21", "v0.2.22"), blob_override=None):
         self.tags = list(tags)
         self.calls = []
         self.blobs, self.manifests, entries = {}, {}, []
         for os_name, arch in PLATFORMS:
-            binary = "{}-{}-binary".format(os_name, arch).encode()
-            self.blobs[_digest(binary)] = blob_override if blob_override is not None else binary
+            archive = _zip({_member(os_name, arch): "{}-{}-binary".format(os_name, arch)})
+            self.blobs[_digest(archive)] = blob_override if blob_override is not None else archive
             manifest = json.dumps({
                 "mediaType": "application/vnd.oci.image.manifest.v1+json",
-                "layers": [{"mediaType": "application/octet-stream", "digest": _digest(binary), "size": len(binary),
-                            "annotations": {"org.opencontainers.image.title": "kubelogin"}}],
+                "layers": [{"mediaType": "application/zip", "digest": _digest(archive), "size": len(archive),
+                            "annotations": {"org.opencontainers.image.title": "kubelogin.zip"}}],
             }).encode()
             self.manifests[_digest(manifest)] = manifest
             entries.append({"digest": _digest(manifest), "platform": {"os": os_name, "architecture": arch}})
@@ -151,10 +166,12 @@ class TestKubeloginOci(unittest.TestCase):
         registry = FakeRegistry()
         client = self._client(registry)
         for os_name, arch in PLATFORMS:
-            layer = get_binary_layer(client.get_platform_manifest("v0.2.22", os_name, arch))
-            dest = os.path.join(self.temp_dir, "{}-{}".format(os_name, arch))
-            client.download_blob(layer, dest)
-            with open(dest, "rb") as f:
+            layer = get_archive_layer(client.get_platform_manifest("v0.2.22", os_name, arch))
+            archive = os.path.join(self.temp_dir, "{}-{}.zip".format(os_name, arch))
+            client.download_blob(layer, archive)
+            binary = os.path.join(self.temp_dir, "{}-{}".format(os_name, arch))
+            extract_single_file(archive, _member(os_name, arch), binary)
+            with open(binary, "rb") as f:
                 self.assertEqual(f.read(), "{}-{}-binary".format(os_name, arch).encode())
 
     def test_missing_platform(self):
@@ -166,23 +183,42 @@ class TestKubeloginOci(unittest.TestCase):
             self._client(FakeRegistry()).get_platform_manifest("v9.9.9", "linux", "amd64")
 
     def test_digest_mismatch(self):
-        client = self._client(FakeRegistry(blob_override=b"tampered-binary!!"))
-        layer = get_binary_layer(client.get_platform_manifest("v0.2.22", "linux", "amd64"))
-        layer = dict(layer, size=len(b"tampered-binary!!"))
+        client = self._client(FakeRegistry(blob_override=b"tampered-archive!"))
+        layer = get_archive_layer(client.get_platform_manifest("v0.2.22", "linux", "amd64"))
+        layer = dict(layer, size=len(b"tampered-archive!"))
         with self.assertRaisesRegex(ClientRequestError, "Digest mismatch"):
-            client.download_blob(layer, os.path.join(self.temp_dir, "kubelogin"))
+            client.download_blob(layer, os.path.join(self.temp_dir, "kubelogin.zip"))
 
     def test_size_mismatch(self):
         client = self._client(FakeRegistry(blob_override=b"short"))
-        layer = get_binary_layer(client.get_platform_manifest("v0.2.22", "linux", "amd64"))
+        layer = get_archive_layer(client.get_platform_manifest("v0.2.22", "linux", "amd64"))
         with self.assertRaisesRegex(ClientRequestError, "Size mismatch"):
-            client.download_blob(layer, os.path.join(self.temp_dir, "kubelogin"))
+            client.download_blob(layer, os.path.join(self.temp_dir, "kubelogin.zip"))
 
     def test_unexpected_layer_format(self):
         with self.assertRaises(ClientRequestError):
-            get_binary_layer({"layers": [{"mediaType": "application/vnd.oci.image.layer.v1.tar+gzip"}]})
+            get_archive_layer({"layers": [{"mediaType": "application/octet-stream"}]})
         with self.assertRaises(ClientRequestError):
-            get_binary_layer({"layers": []})
+            get_archive_layer({"layers": []})
+
+    def test_extract_single_file_rejects_unexpected_content(self):
+        archive = os.path.join(self.temp_dir, "a.zip")
+        dest = os.path.join(self.temp_dir, "out")
+        cases = [
+            {"bin/linux_amd64/kubelogin": "x", "bin/linux_amd64/extra": "y"},
+            {"bin/linux_arm64/kubelogin": "x"},
+            {},
+        ]
+        for files in cases:
+            with self.subTest(files=list(files)):
+                with open(archive, "wb") as f:
+                    f.write(_zip(files))
+                with self.assertRaisesRegex(ClientRequestError, "Unexpected archive content"):
+                    extract_single_file(archive, "bin/linux_amd64/kubelogin", dest)
+        with open(archive, "wb") as f:
+            f.write(b"not a zip")
+        with self.assertRaisesRegex(ClientRequestError, "not a valid zip"):
+            extract_single_file(archive, "bin/linux_amd64/kubelogin", dest)
 
     def test_retries_on_server_error_and_connection_error(self):
         session = mock.MagicMock()
@@ -204,24 +240,28 @@ class TestKubeloginOci(unittest.TestCase):
         install_location = os.path.join(self.temp_dir, "kubelogin")
         with open(install_location, "wb") as f:
             f.write(b"old")
-        registry = FakeRegistry(blob_override=b"tampered-binary!!")
-        with mock.patch("azure.cli.command_modules.acs._kubelogin_oci.requests.Session") as session_cls:
-            session_cls.return_value.get.side_effect = registry.get
-            with self.assertRaises(ClientRequestError):
-                install_binary_from_registry(REGISTRY, REPO, "v0.2.22", "linux", "amd64", install_location)
-        with open(install_location, "rb") as f:
-            self.assertEqual(f.read(), b"old")
-        self.assertEqual(os.listdir(self.temp_dir), ["kubelogin"])
+        for registry, member in ((FakeRegistry(blob_override=b"tampered-archive!"), _member("linux", "amd64")),
+                                 (FakeRegistry(), "bin/linux_amd64/unexpected")):
+            with mock.patch("azure.cli.command_modules.acs._kubelogin_oci.requests.Session") as session_cls:
+                session_cls.return_value.get.side_effect = registry.get
+                with self.assertRaises(ClientRequestError):
+                    install_binary_from_registry(REGISTRY, REPO, "v0.2.22", "linux", "amd64", member,
+                                                 install_location)
+            with open(install_location, "rb") as f:
+                self.assertEqual(f.read(), b"old")
+            self.assertEqual(os.listdir(self.temp_dir), ["kubelogin"])
 
     def test_install_latest(self):
         install_location = os.path.join(self.temp_dir, "kubelogin")
         registry = FakeRegistry()
         with mock.patch("azure.cli.command_modules.acs._kubelogin_oci.requests.Session") as session_cls:
             session_cls.return_value.get.side_effect = registry.get
-            version = install_binary_from_registry(REGISTRY, REPO, "latest", "darwin", "arm64", install_location)
+            version = install_binary_from_registry(REGISTRY, REPO, "latest", "darwin", "arm64",
+                                                   _member("darwin", "arm64"), install_location)
         self.assertEqual(version, "v0.2.22")
         with open(install_location, "rb") as f:
             self.assertEqual(f.read(), b"darwin-arm64-binary")
+        self.assertEqual(os.listdir(self.temp_dir), ["kubelogin"])
 
 
 class TestInstallKubeloginSource(unittest.TestCase):
@@ -244,14 +284,14 @@ class TestInstallKubeloginSource(unittest.TestCase):
     def test_china_cloud_installs_from_mcr_azure_cn(self, mock_urlretrieve, mock_install, _):
         from azure.cli.command_modules.acs.custom import k8s_install_kubelogin
 
-        def fake_install(registry, repository, version, os_name, arch, install_location):
+        def fake_install(registry, repository, version, os_name, arch, member, install_location):
             open(install_location, "w").close()
             return version
         mock_install.side_effect = fake_install
         k8s_install_kubelogin(self._cmd("AzureChinaCloud"), client_version="0.2.22",
                               install_location=self.install_location, arch="arm64")
         mock_install.assert_called_once_with("mcr.azure.cn", "aks/packages/kubernetes/kubelogin", "v0.2.22",
-                                             "linux", "arm64", self.install_location)
+                                             "linux", "arm64", "bin/linux_arm64/kubelogin", self.install_location)
         mock_urlretrieve.assert_not_called()
         self.assertTrue(os.access(self.install_location, os.X_OK))
 
@@ -265,7 +305,7 @@ class TestInstallKubeloginSource(unittest.TestCase):
         k8s_install_kubelogin(self._cmd("AzureChinaCloud"), client_version="latest", install_location=location,
                               arch="arm64")
         mock_install.assert_called_once_with("mcr.azure.cn", "aks/packages/kubernetes/kubelogin", "latest",
-                                             "windows", "amd64", location)
+                                             "windows", "amd64", "bin/windows_amd64/kubelogin.exe", location)
 
     @mock.patch("azure.cli.command_modules.acs.custom.platform.system", return_value="Linux")
     @mock.patch("azure.cli.command_modules.acs._kubelogin_oci.install_binary_from_registry")

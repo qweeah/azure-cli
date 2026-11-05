@@ -5,12 +5,14 @@
 
 """Minimal anonymous OCI registry client used by `az aks install-cli` to download client binaries
 (kubelogin) published as OCI artifacts. See the artifact contract in the AKS package sync:
-one image index per `vX.Y.Z` tag, one manifest per os/architecture with a single raw binary layer."""
+one image index per `vX.Y.Z` tag, one manifest per os/architecture whose single layer is the
+upstream release zip, which contains exactly one file (the binary)."""
 
 import hashlib
 import os
 import re
 import time
+import zipfile
 
 import requests
 from azure.cli.core.azclierror import ClientRequestError
@@ -21,7 +23,7 @@ logger = get_logger(__name__)
 MEDIA_TYPE_OCI_INDEX = "application/vnd.oci.image.index.v1+json"
 MEDIA_TYPE_OCI_MANIFEST = "application/vnd.oci.image.manifest.v1+json"
 MEDIA_TYPE_DOCKER_LIST = "application/vnd.docker.distribution.manifest.list.v2+json"
-MEDIA_TYPE_BINARY_LAYER = "application/octet-stream"
+MEDIA_TYPE_ZIP_LAYER = "application/zip"
 ANNOTATION_TITLE = "org.opencontainers.image.title"
 
 _RETRY_STATUS_CODES = (429, 500, 502, 503, 504)
@@ -59,14 +61,32 @@ def select_platform(index, os_name, architecture):
     return None
 
 
-def get_binary_layer(manifest):
-    """Return the descriptor of the single raw binary layer of a client binary manifest."""
+def get_archive_layer(manifest):
+    """Return the descriptor of the single zip layer of a client binary manifest."""
     layers = manifest.get("layers") or []
-    if len(layers) != 1 or layers[0].get("mediaType") != MEDIA_TYPE_BINARY_LAYER:
+    if len(layers) != 1 or layers[0].get("mediaType") != MEDIA_TYPE_ZIP_LAYER:
         raise ClientRequestError(
             "Unexpected artifact format: expected one '{}' layer, got {}.".format(
-                MEDIA_TYPE_BINARY_LAYER, [layer.get("mediaType") for layer in layers]))
+                MEDIA_TYPE_ZIP_LAYER, [layer.get("mediaType") for layer in layers]))
     return layers[0]
+
+
+def extract_single_file(archive_path, expected_member, destination):
+    """Extract `expected_member` from a zip that must contain exactly that one file."""
+    try:
+        with zipfile.ZipFile(archive_path) as archive:
+            files = [info for info in archive.infolist() if not info.is_dir()]
+            if len(files) != 1 or files[0].filename != expected_member:
+                raise ClientRequestError("Unexpected archive content: expected only '{}', got {}.".format(
+                    expected_member, [info.filename for info in files]))
+            with archive.open(files[0]) as src, open(destination, "wb") as dst:
+                while True:
+                    chunk = src.read(_CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    dst.write(chunk)
+    except zipfile.BadZipFile as ex:
+        raise ClientRequestError("Downloaded archive is not a valid zip: {}".format(ex)) from ex
 
 
 class OciRegistryClient:
@@ -207,8 +227,10 @@ def _verify_digest(content, digest, what):
         raise ClientRequestError("Digest mismatch for {}: got {}.".format(what, actual))
 
 
-def install_binary_from_registry(registry, repository, version, os_name, architecture, install_location):
-    """Download the client binary for os/architecture and atomically replace `install_location`.
+def install_binary_from_registry(registry, repository, version, os_name, architecture, archive_member,
+                                 install_location):
+    """Download the release zip for os/architecture, extract `archive_member` and atomically replace
+    `install_location`.
 
     `version` is a tag such as `v0.2.22`, or `latest` to use the highest released tag.
     On any failure the existing file at `install_location` is left untouched."""
@@ -218,15 +240,18 @@ def install_binary_from_registry(registry, repository, version, os_name, archite
         logger.warning('No version specified, will install the latest version "%s" from "%s"', version,
                        client.reference)
     manifest = client.get_platform_manifest(version, os_name, architecture)
-    layer = get_binary_layer(manifest)
+    layer = get_archive_layer(manifest)
     logger.warning('Downloading client to "%s" from "%s:%s" (%s/%s)', install_location, client.reference,
                    version, os_name, architecture)
     install_dir = os.path.dirname(os.path.abspath(install_location))
-    temp_path = os.path.join(install_dir, ".{}.{}.download".format(os.path.basename(install_location), os.getpid()))
+    prefix = os.path.join(install_dir, ".{}.{}".format(os.path.basename(install_location), os.getpid()))
+    archive_path, binary_path = prefix + ".zip", prefix + ".download"
     try:
-        client.download_blob(layer, temp_path)
-        os.replace(temp_path, install_location)
+        client.download_blob(layer, archive_path)
+        extract_single_file(archive_path, archive_member, binary_path)
+        os.replace(binary_path, install_location)
     finally:
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
+        for path in (archive_path, binary_path):
+            if os.path.exists(path):
+                os.remove(path)
     return version

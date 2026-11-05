@@ -3214,9 +3214,10 @@ def _k8s_install_kubelogin_from_registry(client_version, install_location, arch=
         os.makedirs(install_dir)
 
     version = client_version if client_version == 'latest' else 'v{}'.format(client_version.lstrip('vV'))
+    archive_member = 'bin/{}_{}/{}'.format(os_name, arch, binary_name)
     try:
         install_binary_from_registry(_KUBELOGIN_REGISTRY, _KUBELOGIN_REPOSITORY, version, os_name, arch,
-                                     install_location)
+                                     archive_member, install_location)
     except ClientRequestError as ex:
         raise ClientRequestError(
             'Failed to install kubelogin from {}/{}: {}'.format(_KUBELOGIN_REGISTRY, _KUBELOGIN_REPOSITORY, ex),

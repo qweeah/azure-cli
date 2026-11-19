@@ -30,7 +30,7 @@ def create_kubelogin_zip(file_url, download_path):
         elif system == "Darwin":
             bin_dir += "/darwin_amd64"
         os.makedirs(bin_dir)
-        bin_location = os.path.join(bin_dir, "kubelogin")
+        bin_location = os.path.join(bin_dir, "kubelogin.exe" if system == "Windows" else "kubelogin")
         open(bin_location, "a").close()
         with zipfile.ZipFile(download_path, "w", zipfile.ZIP_DEFLATED) as outZipFile:
             outZipFile.write(bin_location)

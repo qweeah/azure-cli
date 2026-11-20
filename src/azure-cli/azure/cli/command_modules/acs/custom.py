@@ -3028,10 +3028,11 @@ def k8s_install_kubectl(cmd, client_version='latest', install_location=None, sou
     """
 
     if not source_url:
+        if cmd.cli_ctx.cloud.name.lower() == 'azurechinacloud':
+            _k8s_install_cli_from_registry('kubectl', _KUBECTL_REPOSITORY, client_version, install_location,
+                                           arch, '--base-src-url')
+            return
         source_url = "https://dl.k8s.io/release"
-        cloud_name = cmd.cli_ctx.cloud.name
-        if cloud_name.lower() == 'azurechinacloud':
-            source_url = 'https://mirror.azure.cn/kubernetes/kubectl'
 
     if client_version == 'latest':
         latest_version_url = source_url + '/stable.txt'
@@ -3132,9 +3133,11 @@ def k8s_install_kubelogin(cmd, client_version='latest', install_location=None, s
     cloud_name = cmd.cli_ctx.cloud.name
 
     if not source_url:
-        source_url = 'https://github.com/Azure/kubelogin/releases/download'
         if cloud_name.lower() == 'azurechinacloud':
-            source_url = 'https://mirror.azure.cn/kubernetes/kubelogin'
+            _k8s_install_cli_from_registry('kubelogin', _KUBELOGIN_REPOSITORY, client_version, install_location,
+                                           arch, '--kubelogin-base-src-url')
+            return
+        source_url = 'https://github.com/Azure/kubelogin/releases/download'
 
     if client_version == 'latest':
         client_version = _get_latest_kubelogin_version(cloud_name, gh_token=gh_token)
@@ -3181,6 +3184,47 @@ def k8s_install_kubelogin(cmd, client_version='latest', install_location=None, s
         shutil.move(download_path, install_location)
     os.chmod(install_location, os.stat(install_location).st_mode |
              stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+    if system == 'Windows':
+        handle_windows_post_install(install_dir, cli)
+    else:
+        logger.warning('Please ensure that %s is in your search PATH, so the `%s` command can be found.',
+                       install_dir, cli)
+
+
+_CLI_REGISTRY = 'mcr.azure.cn'
+_KUBELOGIN_REPOSITORY = 'aks/packages/cli/azure/kubelogin'
+_KUBECTL_REPOSITORY = 'aks/packages/cli/kubernetes/kubectl'
+
+
+def _k8s_install_cli_from_registry(cli_name, repository, client_version, install_location, arch,
+                                   override_flag):
+    from azure.cli.command_modules.acs._cli_registry import install_binary_from_registry
+
+    system = platform.system()
+    if system == 'Windows':
+        os_name, binary_name, arch = 'windows', cli_name + '.exe', 'amd64'
+    elif system in ('Linux', 'Darwin'):
+        os_name, binary_name = system.lower(), cli_name
+        if arch is None:
+            arch = get_arch_for_cli_binary()
+    else:
+        raise UnknownError("Unsupported system '{}'.".format(system))
+
+    validate_install_location(install_location, binary_name)
+    install_dir, cli = os.path.dirname(install_location), os.path.basename(install_location)
+    if not os.path.exists(install_dir):
+        os.makedirs(install_dir)
+
+    version = client_version if client_version == 'latest' else 'v{}'.format(client_version.lstrip('vV'))
+    try:
+        install_binary_from_registry(_CLI_REGISTRY, repository, cli_name, version, os_name, arch, install_location)
+    except ClientRequestError as ex:
+        raise ClientRequestError(
+            'Failed to install {} from {}/{}: {}'.format(cli_name, _CLI_REGISTRY, repository, ex),
+            recommendation='Please retry later, or use {} to download {} from another source.'.format(
+                override_flag, cli_name)) from ex
+    os.chmod(install_location, os.stat(install_location).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
     if system == 'Windows':
         handle_windows_post_install(install_dir, cli)

@@ -4,9 +4,9 @@
 # --------------------------------------------------------------------------------------------
 
 """Minimal anonymous OCI registry client used by `az aks install-cli` to download AKS client binaries
-(kubelogin, kubectl) published as OCI artifacts. See the artifact contract in the AKS package sync:
-one image index per `vX.Y.Z` tag, one manifest per os/architecture whose single layer is a zip that
-contains exactly one file, the binary at `bin/<os>_<arch>/<name>[.exe]`."""
+(kubelogin, kubectl) published as OCI artifacts: one image index per `vX.Y.Z` tag, one manifest per
+os/architecture whose single layer is a zip that contains exactly one file, the binary at
+`bin/<os>_<arch>/<name>[.exe]`."""
 
 import hashlib
 import os
@@ -63,8 +63,7 @@ def select_platform(index, os_name, architecture):
 def get_archive_layer(manifest):
     """Return the descriptor of the single zip layer of a client binary manifest.
 
-    The layer is identified by its title (`*.zip`); media types are the oras defaults and are not part of
-    the contract."""
+    The layer is identified by its title (`*.zip`); media types are not relied on."""
     layers = manifest.get("layers") or []
     titles = [(layer.get("annotations") or {}).get(ANNOTATION_TITLE, "") for layer in layers]
     if len(layers) != 1 or not titles[0].lower().endswith(".zip"):
